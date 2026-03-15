@@ -277,38 +277,45 @@ foreach ($file in $sizeCheckedFiles) {
     $infoJobs += @{ Handle = $ps; AsyncResult = $ps.BeginInvoke(); Path = $file.Path; SizeMB = $file.SizeMB }
 }
 
-# フェーズ3: 結果を収集してキューを構築
-$jobQueue = @()
-foreach ($infoJob in $infoJobs) {
-    $videoInfo = $infoJob.Handle.EndInvoke($infoJob.AsyncResult)[0]
-    $infoJob.Handle.Dispose()
-
-    $filePath = $infoJob.Path
-    $fileSizeMB = $infoJob.SizeMB
-    Write-Log "キューに追加: $(Split-Path $filePath -Leaf) ($($videoInfo.Width)x$($videoInfo.Height), $('{0:F1}' -f $fileSizeMB) MB)"
-
-    $tempFile = "$filePath.tmp.$OUTPUT_FORMAT"
-    $backupFile = "$filePath.bak"
-
-    # バックアップを作成（ハードリンク優先、失敗時はコピー）
-    try {
-        New-Item -ItemType HardLink -Path $backupFile -Target $filePath -ErrorAction Stop | Out-Null
-    } catch {
-        Copy-Item -Path $filePath -Destination $backupFile -Force
-    }
-
-    $jobQueue += @{
-        InputFile = $filePath
-        OutputFile = $tempFile
-        BackupFile = $backupFile
-        VideoInfo = $videoInfo
-    }
-}
-
-# ジョブを実行
+# フェーズ3: 情報取得完了次第キューに追加し、圧縮を並行して実行（パイプライン化）
 $spinnerIndex = 0
-while ($jobQueue.Count -gt 0 -or $runningJobs.Count -gt 0) {
-    # 完了したジョブを確認
+while ($infoJobs.Count -gt 0 -or $jobQueue.Count -gt 0 -or $runningJobs.Count -gt 0) {
+    # 完了した情報取得ジョブをキューに追加
+    $completedInfoJobs = @()
+    foreach ($infoJob in $infoJobs) {
+        if ($infoJob.AsyncResult.IsCompleted) {
+            $videoInfo = $infoJob.Handle.EndInvoke($infoJob.AsyncResult)[0]
+            $infoJob.Handle.Dispose()
+
+            $filePath = $infoJob.Path
+            $fileSizeMB = $infoJob.SizeMB
+            Write-Host ""  # スピナーをクリア
+            Write-Log "キューに追加: $(Split-Path $filePath -Leaf) ($($videoInfo.Width)x$($videoInfo.Height), $('{0:F1}' -f $fileSizeMB) MB)"
+
+            $tempFile = "$filePath.tmp.$OUTPUT_FORMAT"
+            $backupFile = "$filePath.bak"
+
+            # バックアップを作成（ハードリンク優先、失敗時はコピー）
+            try {
+                New-Item -ItemType HardLink -Path $backupFile -Target $filePath -ErrorAction Stop | Out-Null
+            } catch {
+                Copy-Item -Path $filePath -Destination $backupFile -Force
+            }
+
+            $jobQueue += @{
+                InputFile = $filePath
+                OutputFile = $tempFile
+                BackupFile = $backupFile
+                VideoInfo = $videoInfo
+            }
+            $completedInfoJobs += $infoJob
+        }
+    }
+    foreach ($infoJob in $completedInfoJobs) {
+        $infoJobs = $infoJobs | Where-Object { $_ -ne $infoJob }
+    }
+
+    # 完了した圧縮ジョブを確認
     $completedJobs = @()
     foreach ($job in $runningJobs) {
         if ($job.AsyncResult.IsCompleted) {
@@ -325,8 +332,6 @@ while ($jobQueue.Count -gt 0 -or $runningJobs.Count -gt 0) {
             $completedJobs += $job
         }
     }
-
-    # 完了したジョブを削除
     foreach ($job in $completedJobs) {
         $runningJobs = $runningJobs | Where-Object { $_ -ne $job }
     }
@@ -353,14 +358,10 @@ while ($jobQueue.Count -gt 0 -or $runningJobs.Count -gt 0) {
     }
 
     # 進捗表示とスピナー
-    if ($runningJobs.Count -gt 0 -or $jobQueue.Count -gt 0) {
-        $totalProcessed = $processed + $failed + $runningJobs.Count + $jobQueue.Count
-        $currentProcessing = $processed + $failed
-        $activity = "実行中: $($runningJobs.Count)件, 待機中: $($jobQueue.Count)件"
-        
+    if ($infoJobs.Count -gt 0 -or $runningJobs.Count -gt 0 -or $jobQueue.Count -gt 0) {
+        $activity = "情報取得中: $($infoJobs.Count)件, 実行中: $($runningJobs.Count)件, 待機中: $($jobQueue.Count)件"
         Show-Spinner "処理中... $activity" $spinnerIndex
         $spinnerIndex++
-        
         Start-Sleep -Milliseconds 500
     }
 }
