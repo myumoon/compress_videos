@@ -276,8 +276,12 @@ foreach ($video in $videos) {
     $tempFile = "$filePath.tmp.$OUTPUT_FORMAT"
     $backupFile = "$filePath.bak"
 
-    # バックアップを作成
-    Copy-Item -Path $filePath -Destination $backupFile -Force
+    # バックアップを作成（ハードリンク優先、失敗時はコピー）
+    try {
+        New-Item -ItemType HardLink -Path $backupFile -Target $filePath -ErrorAction Stop | Out-Null
+    } catch {
+        Copy-Item -Path $filePath -Destination $backupFile -Force
+    }
 
     $jobQueue += @{
         InputFile = $filePath
