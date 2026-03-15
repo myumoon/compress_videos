@@ -103,15 +103,11 @@ function Get-FileSizeInMB {
     return 0
 }
 
-# 動画情報を取得
-function Get-VideoInfo {
-    param([string]$FilePath)
-    $output = & $FFMPEG_CMD -i "$FilePath" 2>&1
-    $info = @{
-        Duration = 0
-        Width = 0
-        Height = 0
-    }
+# 動画情報取得スクリプトブロック（並列実行用）
+$getVideoInfoScript = {
+    param([string]$FilePath, [string]$FfmpegCmd)
+    $output = & $FfmpegCmd -i "$FilePath" 2>&1
+    $info = @{ Duration = 0; Width = 0; Height = 0 }
     # Duration: 00:05:30.12 の形式から秒数を取得
     $durationLine = $output | Select-String 'Duration:\s*(\d+):(\d+):(\d+)\.(\d+)'
     if ($durationLine) {
@@ -260,6 +256,8 @@ $failed = 0
 $startTime = Get-Date
 
 # ジョブキューを作成
+# フェーズ1: サイズチェックを先に実施
+$sizeCheckedFiles = @()
 foreach ($video in $videos) {
     $filePath = $video.FullName
     $fileSizeMB = Get-FileSizeInMB $filePath
@@ -269,8 +267,24 @@ foreach ($video in $videos) {
         $skipped++
         continue
     }
+    $sizeCheckedFiles += @{ Path = $filePath; SizeMB = $fileSizeMB }
+}
 
-    $videoInfo = Get-VideoInfo $filePath
+# フェーズ2: 動画情報を並列取得
+$infoJobs = @()
+foreach ($file in $sizeCheckedFiles) {
+    $ps = [PowerShell]::Create().AddScript($getVideoInfoScript).AddArgument($file.Path).AddArgument($FFMPEG_CMD)
+    $infoJobs += @{ Handle = $ps; AsyncResult = $ps.BeginInvoke(); Path = $file.Path; SizeMB = $file.SizeMB }
+}
+
+# フェーズ3: 結果を収集してキューを構築
+$jobQueue = @()
+foreach ($infoJob in $infoJobs) {
+    $videoInfo = $infoJob.Handle.EndInvoke($infoJob.AsyncResult)[0]
+    $infoJob.Handle.Dispose()
+
+    $filePath = $infoJob.Path
+    $fileSizeMB = $infoJob.SizeMB
     Write-Log "キューに追加: $(Split-Path $filePath -Leaf) ($($videoInfo.Width)x$($videoInfo.Height), $('{0:F1}' -f $fileSizeMB) MB)"
 
     $tempFile = "$filePath.tmp.$OUTPUT_FORMAT"
