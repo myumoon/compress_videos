@@ -4,7 +4,29 @@
 $MIN_SIZE_FOR_COMPRESS = 500MB
 $OUTPUT_FORMAT = "mp4"
 $FFMPEG_CMD = "ffmpeg"
-$MAX_PARALLEL_JOBS = [Math]::Max(1, (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors - 1)
+
+# ドライブタイプを判定して並列度を決定
+function Get-OptimalParallelJobs {
+    param([string]$FilePath)
+    
+    $drive = (Get-Item $FilePath).PSDrive.Name
+    $driveInfo = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$($drive):'"
+    
+    # ドライブタイプ: 2=フロッピーディスク, 3=HDD, 4=リムーバブルメディア, 5=CD-ROM
+    $driveType = $driveInfo.DriveType
+    $cpuCores = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+    
+    if ($driveType -eq 3) {
+        # HDD: 並列度を1～2に制限
+        Write-Log "HDD検出: 並列度を制限します"
+        return [Math]::Max(1, [Math]::Min(2, $cpuCores - 1))
+    } else {
+        # SSD: 通常通りコア数-1で処理
+        return [Math]::Max(1, $cpuCores - 1)
+    }
+}
+
+$MAX_PARALLEL_JOBS = 0  # 後で設定される
 
 # ログ出力関数
 function Write-Log {
@@ -119,6 +141,9 @@ function Get-VideoFiles {
 # メイン処理
 Write-Log "処理開始"
 Write-Log "入力パス: $InputPath"
+
+# ドライブタイプに応じて並列度を決定
+$MAX_PARALLEL_JOBS = Get-OptimalParallelJobs $InputPath
 Write-Log "並列ジョブ数: $MAX_PARALLEL_JOBS"
 
 $videos = Get-VideoFiles $InputPath
@@ -135,6 +160,7 @@ $processed = 0
 $skipped = 0
 $failed = 0
 $runningJobs = @()
+$startTime = Get-Date
 
 # ジョブキューを作成
 foreach ($video in $videos) {
@@ -206,3 +232,8 @@ while ($jobQueue.Count -gt 0 -or $runningJobs.Count -gt 0) {
 }
 
 Write-Log "処理完了: 圧縮$processed件、スキップ$skipped件、失敗$failed件"
+
+$endTime = Get-Date
+$totalTime = $endTime - $startTime
+Write-Log "総処理時間: $($totalTime.Hours)時間 $($totalTime.Minutes)分 $($totalTime.Seconds)秒"
+
