@@ -28,11 +28,69 @@ function Get-OptimalParallelJobs {
 
 $MAX_PARALLEL_JOBS = 0  # 後で設定される
 
+# グローバル変数：スピナー状態
+$spinnerIndex = 0
+$spinnerChars = @('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
+$runningJobs = @()  # グローバル変数化して割り込みハンドラーからアクセス可能に
+
+# クリーンアップ関数
+function Cleanup-Jobs {
+    Write-Host ""
+    Write-Log "キャンセル中..." "WARN"
+    
+    foreach ($job in $runningJobs) {
+        try {
+            $job.Handle.Stop()
+            $job.Handle.Dispose()
+        } catch {
+            # スルー
+        }
+    }
+    
+    # ffmpegプロセスを全て強制終了
+    try {
+        Get-Process ffmpeg -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Write-Log "ffmpegプロセスを終了しました" "INFO"
+    } catch {
+        # スルー
+    }
+    
+    Write-Log "キャンセルしました" "WARN"
+    exit 1
+}
+
+# Ctrl+C割り込みハンドラーを登録
+$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { Cleanup-Jobs }
+
 # ログ出力関数
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-Host "[$timestamp] [$Level] $Message"
+}
+
+# スピナー表示関数
+function Show-Spinner {
+    param([string]$Message, [int]$Index)
+    $spinner = $spinnerChars[$Index % $spinnerChars.Count]
+    Write-Host "`r$spinner $Message" -NoNewline -ForegroundColor Cyan
+}
+
+# 進捗表示関数
+function Show-Progress {
+    param(
+        [int]$Current,
+        [int]$Total,
+        [string]$Activity
+    )
+    if ($Total -eq 0) { return }
+    
+    $percentage = [math]::Round(($Current / $Total) * 100)
+    $barLength = 20
+    $filledLength = [math]::Round(($Current / $Total) * $barLength)
+    $bar = ('█' * $filledLength) + ('░' * ($barLength - $filledLength))
+    
+    Write-Host "`r[$bar] $percentage% ($Current/$Total) - $Activity" -NoNewline -ForegroundColor Green
 }
 
 # ファイルサイズを取得
@@ -140,13 +198,44 @@ function Get-VideoFiles {
 
 # メイン処理
 Write-Log "処理開始"
-Write-Log "入力パス: $InputPath"
 
-# ドライブタイプに応じて並列度を決定
-$MAX_PARALLEL_JOBS = Get-OptimalParallelJobs $InputPath
+# 入力パスを複数対応に解析
+if ([string]::IsNullOrWhiteSpace($InputPath)) {
+    Write-Log "エラー: パスが入力されていません" "ERROR"
+    exit 1
+}
+
+$inputPaths = @()
+if ($InputPath -match '^".*"$|^''.*''$') {
+    # クォーテーション囲みを削除
+    $InputPath = $InputPath -replace '^["'']|["'']$', ''
+}
+
+# セミコロンまたはカンマで複数パスを分割
+if ($InputPath -contains ';' -or $InputPath -contains ',') {
+    $inputPaths = $InputPath -split '[;,]' | ForEach-Object { $_.Trim() }
+} else {
+    $inputPaths = @($InputPath)
+}
+
+Write-Log "入力パス数: $($inputPaths.Count)"
+foreach ($path in $inputPaths) {
+    Write-Log "  - $path"
+}
+
+# ドライブタイプに応じて並列度を決定（最初のパスから判定）
+$MAX_PARALLEL_JOBS = Get-OptimalParallelJobs $inputPaths[0]
 Write-Log "並列ジョブ数: $MAX_PARALLEL_JOBS"
 
-$videos = Get-VideoFiles $InputPath
+# 全ての入力パスから動画ファイルを集約
+$videos = @()
+foreach ($path in $inputPaths) {
+    if (-not (Test-Path $path)) {
+        Write-Log "警告: パスが見つかりません: $path" "WARN"
+        continue
+    }
+    $videos += Get-VideoFiles $path
+}
 
 if ($videos.Count -eq 0) {
     Write-Log "対象の動画ファイルが見つかりません" "WARN"
@@ -159,7 +248,6 @@ $jobQueue = @()
 $processed = 0
 $skipped = 0
 $failed = 0
-$runningJobs = @()
 $startTime = Get-Date
 
 # ジョブキューを作成
@@ -188,6 +276,7 @@ foreach ($video in $videos) {
 }
 
 # ジョブを実行
+$spinnerIndex = 0
 while ($jobQueue.Count -gt 0 -or $runningJobs.Count -gt 0) {
     # 完了したジョブを確認
     $completedJobs = @()
@@ -195,9 +284,11 @@ while ($jobQueue.Count -gt 0 -or $runningJobs.Count -gt 0) {
         if ($job.Handle.IsCompleted) {
             $result = $job.Handle.EndInvoke($job.AsyncResult)
             if ($result.Success) {
+                Write-Host ""  # スピナーをクリア
                 Write-Log "圧縮完了: $($result.File)" "SUCCESS"
                 $processed++
             } else {
+                Write-Host ""  # スピナーをクリア
                 Write-Log "圧縮失敗: $($result.File)" "ERROR"
                 $failed++
             }
@@ -215,6 +306,7 @@ while ($jobQueue.Count -gt 0 -or $runningJobs.Count -gt 0) {
         $jobItem = $jobQueue[0]
         $jobQueue = $jobQueue[1..($jobQueue.Count - 1)]
 
+        Write-Host ""  # スピナーをクリア
         Write-Log "圧縮開始: $(Split-Path $jobItem.InputFile -Leaf)"
 
         $ps = [PowerShell]::Create().AddScript($compressionScript).AddArgument($jobItem)
@@ -226,10 +318,20 @@ while ($jobQueue.Count -gt 0 -or $runningJobs.Count -gt 0) {
         }
     }
 
-    if ($runningJobs.Count -gt 0) {
+    # 進捗表示とスピナー
+    if ($runningJobs.Count -gt 0 -or $jobQueue.Count -gt 0) {
+        $totalProcessed = $processed + $failed + $runningJobs.Count + $jobQueue.Count
+        $currentProcessing = $processed + $failed
+        $activity = "実行中: $($runningJobs.Count)件, 待機中: $($jobQueue.Count)件"
+        
+        Show-Spinner "処理中... $activity" $spinnerIndex
+        $spinnerIndex++
+        
         Start-Sleep -Milliseconds 500
     }
 }
+
+Write-Host ""  # スピナーをクリア
 
 Write-Log "処理完了: 圧縮$processed件、スキップ$skipped件、失敗$failed件"
 
