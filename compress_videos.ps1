@@ -4,6 +4,7 @@
 $MIN_SIZE_FOR_COMPRESS = 500MB
 $OUTPUT_FORMAT = "mp4"
 $FFMPEG_CMD = "ffmpeg"
+$FFPROBE_CMD = "ffprobe"
 
 # ドライブタイプを判定して並列度を決定
 function Get-OptimalParallelJobs {
@@ -105,21 +106,23 @@ function Get-FileSizeInMB {
 
 # 動画情報取得スクリプトブロック（並列実行用）
 $getVideoInfoScript = {
-    param([string]$FilePath, [string]$FfmpegCmd)
-    $output = & $FfmpegCmd -i "$FilePath" 2>&1
+    param([string]$FilePath, [string]$FfprobeCmd)
     $info = @{ Duration = 0; Width = 0; Height = 0 }
-    # Duration: 00:05:30.12 の形式から秒数を取得
-    $durationLine = $output | Select-String 'Duration:\s*(\d+):(\d+):(\d+)\.(\d+)'
-    if ($durationLine) {
-        $m = $durationLine.Matches[0].Groups
-        $info.Duration = [int]$m[1].Value * 3600 + [int]$m[2].Value * 60 + [int]$m[3].Value + [double]"0.$($m[4].Value)"
+    $json = & $FfprobeCmd -v quiet -print_format json -show_streams -show_format "$FilePath" 2>$null
+    if (-not $json) { return $info }
+    $data = $json | ConvertFrom-Json
+    # フォーマットから再生時間を取得（秒）
+    if ($data.format.duration) {
+        $info.Duration = [double]$data.format.duration
     }
-    # Video: ... 1920x1080 の形式から解像度を取得
-    $videoLine = $output | Select-String 'Stream.*Video.*\s(\d{2,5})x(\d{2,5})'
-    if ($videoLine) {
-        $m = $videoLine.Matches[0].Groups
-        $info.Width = [int]$m[1].Value
-        $info.Height = [int]$m[2].Value
+    # 映像ストリームから解像度を取得
+    $videoStream = $data.streams | Where-Object { $_.codec_type -eq 'video' } | Select-Object -First 1
+    if ($videoStream) {
+        $info.Width = [int]$videoStream.width
+        $info.Height = [int]$videoStream.height
+        if (-not $info.Duration -and $videoStream.duration) {
+            $info.Duration = [double]$videoStream.duration
+        }
     }
     return $info
 }
@@ -273,7 +276,7 @@ foreach ($video in $videos) {
 # フェーズ2: 動画情報を並列取得
 $infoJobs = @()
 foreach ($file in $sizeCheckedFiles) {
-    $ps = [PowerShell]::Create().AddScript($getVideoInfoScript).AddArgument($file.Path).AddArgument($FFMPEG_CMD)
+    $ps = [PowerShell]::Create().AddScript($getVideoInfoScript).AddArgument($file.Path).AddArgument($FFPROBE_CMD)
     $infoJobs += @{ Handle = $ps; AsyncResult = $ps.BeginInvoke(); Path = $file.Path; SizeMB = $file.SizeMB }
 }
 
