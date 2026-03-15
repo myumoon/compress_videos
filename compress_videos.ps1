@@ -148,12 +148,19 @@ $compressionScript = {
     $OutputFile = $Job.OutputFile
     $VideoInfo = $Job.VideoInfo
     $BackupFile = $Job.BackupFile
-    
+
+    # バックアップを作成（ハードリンク優先、失敗時はコピー）
+    try {
+        New-Item -ItemType HardLink -Path $BackupFile -Target $InputFile -ErrorAction Stop | Out-Null
+    } catch {
+        Copy-Item -Path $InputFile -Destination $BackupFile -Force
+    }
+
     $resolution = "$($VideoInfo.Width):$($VideoInfo.Height)"
     if ($VideoInfo.Duration / 60 -ge 10 -and ($VideoInfo.Width -ge 3840 -or $VideoInfo.Height -ge 2160)) {
         $resolution = "1920:1080"
     }
-    
+
     # CRF値は品質とファイルサイズのバランスを調整するためのもので23は一般的なデフォルト値
     $crf = 23
 
@@ -297,13 +304,6 @@ while ($infoJobs.Count -gt 0 -or $jobQueue.Count -gt 0 -or $runningJobs.Count -g
 
             $tempFile = "$filePath.tmp.$OUTPUT_FORMAT"
             $backupFile = "$filePath.bak"
-
-            # バックアップを作成（ハードリンク優先、失敗時はコピー）
-            try {
-                New-Item -ItemType HardLink -Path $backupFile -Target $filePath -ErrorAction Stop | Out-Null
-            } catch {
-                Copy-Item -Path $filePath -Destination $backupFile -Force
-            }
 
             $jobQueue += @{
                 InputFile = $filePath
