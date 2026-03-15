@@ -106,16 +106,24 @@ function Get-FileSizeInMB {
 # 動画情報を取得
 function Get-VideoInfo {
     param([string]$FilePath)
-    $output = & $FFMPEG_CMD -v error -select_streams v:0 -show_entries stream=duration,width,height -of csv=p=0 "$FilePath" 2>&1 | Select-Object -First 1
+    $output = & $FFMPEG_CMD -i "$FilePath" 2>&1
     $info = @{
         Duration = 0
         Width = 0
         Height = 0
     }
-    if ($output -match '(\d+\.?\d*),(\d+),(\d+)') {
-        $info.Duration = [double]$matches[1]
-        $info.Width = [int]$matches[2]
-        $info.Height = [int]$matches[3]
+    # Duration: 00:05:30.12 の形式から秒数を取得
+    $durationLine = $output | Select-String 'Duration:\s*(\d+):(\d+):(\d+)\.(\d+)'
+    if ($durationLine) {
+        $m = $durationLine.Matches[0].Groups
+        $info.Duration = [int]$m[1].Value * 3600 + [int]$m[2].Value * 60 + [int]$m[3].Value + [double]"0.$($m[4].Value)"
+    }
+    # Video: ... 1920x1080 の形式から解像度を取得
+    $videoLine = $output | Select-String 'Stream.*Video.*\s(\d{2,5})x(\d{2,5})'
+    if ($videoLine) {
+        $m = $videoLine.Matches[0].Groups
+        $info.Width = [int]$m[1].Value
+        $info.Height = [int]$m[2].Value
     }
     return $info
 }
@@ -142,14 +150,14 @@ $compressionScript = {
     $VideoInfo = $Job.VideoInfo
     $BackupFile = $Job.BackupFile
     
-    $resolution = $VideoInfo.Width -as [string] + ":$($VideoInfo.Height)"
+    $resolution = "$($VideoInfo.Width):$($VideoInfo.Height)"
     if ($VideoInfo.Duration / 60 -ge 10 -and ($VideoInfo.Width -ge 3840 -or $VideoInfo.Height -ge 2160)) {
         $resolution = "1920:1080"
     }
     
     # CRF値は品質とファイルサイズのバランスを調整するためのもので23は一般的なデフォルト値
     $crf = 23
-    
+
     $command = @(
         "-i", $InputFile,
         "-c:v", "libx264",
@@ -162,13 +170,13 @@ $compressionScript = {
         $OutputFile
     )
     
-    & $FFMPEG_CMD $command | Out-Null
-    
+    $errorOutput = & $FFMPEG_CMD $command 2>&1
+
     if ($LASTEXITCODE -eq 0) {
         Remove-Item -Path $InputFile -Force -ErrorAction SilentlyContinue
         Rename-Item -Path $OutputFile -NewName $InputFile -Force -ErrorAction SilentlyContinue
         Remove-Item -Path $BackupFile -ErrorAction SilentlyContinue
-        return @{ Success = $true; File = (Split-Path $InputFile -Leaf) }
+        return @{ Success = $true; File = (Split-Path $InputFile -Leaf); Error = "" }
     } else {
         # 圧縮失敗時は元ファイルを復元
         Remove-Item -Path $OutputFile -Force -ErrorAction SilentlyContinue
@@ -176,7 +184,8 @@ $compressionScript = {
             Remove-Item -Path $InputFile -Force -ErrorAction SilentlyContinue
             Rename-Item -Path $BackupFile -NewName $InputFile -Force -ErrorAction SilentlyContinue
         }
-        return @{ Success = $false; File = (Split-Path $InputFile -Leaf) }
+        $errMsg = ($errorOutput | Out-String).Trim()
+        return @{ Success = $false; File = (Split-Path $InputFile -Leaf); Error = $errMsg }
     }
 }
 
@@ -187,7 +196,7 @@ function Get-VideoFiles {
 
     if ((Get-Item $Path) -is [System.IO.FileInfo]) {
         if ($Path -match '\.(mp4|mov)$') {
-            $videos += $Path
+            $videos += Get-Item $Path
         }
     } else {
         $videos += Get-ChildItem -Path $Path -Recurse -Include @("*.mp4", "*.mov")
@@ -212,7 +221,7 @@ if ($InputPath -match '^".*"$|^''.*''$') {
 }
 
 # セミコロンまたはカンマで複数パスを分割
-if ($InputPath -contains ';' -or $InputPath -contains ',') {
+if ($InputPath.Contains(';') -or $InputPath.Contains(',')) {
     $inputPaths = $InputPath -split '[;,]' | ForEach-Object { $_.Trim() }
 } else {
     $inputPaths = @($InputPath)
@@ -255,7 +264,7 @@ foreach ($video in $videos) {
     $filePath = $video.FullName
     $fileSizeMB = Get-FileSizeInMB $filePath
 
-    if ($fileSizeMB -le 500) {
+    if ($fileSizeMB -le ($MIN_SIZE_FOR_COMPRESS / 1MB)) {
         Write-Log "スキップ: $(Split-Path $filePath -Leaf) ($('{0:F1}' -f $fileSizeMB) MB)" "WARN"
         $skipped++
         continue
@@ -266,6 +275,9 @@ foreach ($video in $videos) {
 
     $tempFile = "$filePath.tmp.$OUTPUT_FORMAT"
     $backupFile = "$filePath.bak"
+
+    # バックアップを作成
+    Copy-Item -Path $filePath -Destination $backupFile -Force
 
     $jobQueue += @{
         InputFile = $filePath
@@ -281,7 +293,7 @@ while ($jobQueue.Count -gt 0 -or $runningJobs.Count -gt 0) {
     # 完了したジョブを確認
     $completedJobs = @()
     foreach ($job in $runningJobs) {
-        if ($job.Handle.IsCompleted) {
+        if ($job.AsyncResult.IsCompleted) {
             $result = $job.Handle.EndInvoke($job.AsyncResult)
             if ($result.Success) {
                 Write-Host ""  # スピナーをクリア
@@ -289,7 +301,7 @@ while ($jobQueue.Count -gt 0 -or $runningJobs.Count -gt 0) {
                 $processed++
             } else {
                 Write-Host ""  # スピナーをクリア
-                Write-Log "圧縮失敗: $($result.File)" "ERROR"
+                Write-Log "圧縮失敗: $($result.File)`n$($result.Error)" "ERROR"
                 $failed++
             }
             $completedJobs += $job
@@ -304,7 +316,11 @@ while ($jobQueue.Count -gt 0 -or $runningJobs.Count -gt 0) {
     # 新しいジョブを開始
     while ($runningJobs.Count -lt $MAX_PARALLEL_JOBS -and $jobQueue.Count -gt 0) {
         $jobItem = $jobQueue[0]
-        $jobQueue = $jobQueue[1..($jobQueue.Count - 1)]
+        if ($jobQueue.Count -le 1) {
+            $jobQueue = @()
+        } else {
+            $jobQueue = $jobQueue[1..($jobQueue.Count - 1)]
+        }
 
         Write-Host ""  # スピナーをクリア
         Write-Log "圧縮開始: $(Split-Path $jobItem.InputFile -Leaf)"
