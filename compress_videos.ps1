@@ -5,6 +5,8 @@ $MIN_SIZE_FOR_COMPRESS = 500MB
 $OUTPUT_FORMAT = "mp4"
 $FFMPEG_CMD = "ffmpeg"
 $FFPROBE_CMD = "ffprobe"
+$CRF23_BITS_PER_PIXEL = 2.5      # CRF 23/medium preset時の推定bps/ピクセル（4K@30fps≒20Mbps、1080p@30fps≒5Mbps）
+$DOWNSCALE_THRESHOLD_GB = 10     # 推定圧縮後サイズがこの値(GB)以上なら1920:1080にダウンスケール
 
 # ドライブタイプを判定して並列度を決定
 function Get-OptimalParallelJobs {
@@ -106,7 +108,7 @@ function Get-FileSizeInMB {
 
 # 動画情報取得スクリプトブロック（並列実行用）
 $getVideoInfoScript = {
-    param([string]$FilePath, [string]$FfprobeCmd)
+    param([string]$FilePath, [string]$FfprobeCmd, [double]$Crf23BitsPerPixel)
     $info = @{ Duration = 0; Width = 0; Height = 0 }
     $json = & $FfprobeCmd -v quiet -print_format json -show_streams -show_format "$FilePath" 2>$null
     if (-not $json) { return $info }
@@ -124,6 +126,8 @@ $getVideoInfoScript = {
             $info.Duration = [double]$videoStream.duration
         }
     }
+    # 推定圧縮後サイズ（解像度×bps/ピクセルで算出）
+    $info.EstimatedSizeGB = $info.Duration * $info.Width * $info.Height * $Crf23BitsPerPixel / 8 / 1GB
     return $info
 }
 
@@ -148,6 +152,7 @@ $compressionScript = {
     $OutputFile = $Job.OutputFile
     $VideoInfo = $Job.VideoInfo
     $BackupFile = $Job.BackupFile
+    $DownscaleThresholdGB = $Job.DownscaleThresholdGB
 
     # バックアップを作成（ハードリンク優先、失敗時はコピー）
     try {
@@ -157,7 +162,7 @@ $compressionScript = {
     }
 
     $resolution = "$($VideoInfo.Width):$($VideoInfo.Height)"
-    if ($VideoInfo.Duration / 60 -ge 10 -and ($VideoInfo.Width -ge 3840 -or $VideoInfo.Height -ge 2160)) {
+    if ($VideoInfo.EstimatedSizeGB -ge $DownscaleThresholdGB) {
         $resolution = "1920:1080"
     }
 
@@ -283,7 +288,7 @@ foreach ($video in $videos) {
 # フェーズ2: 動画情報を並列取得
 $infoJobs = @()
 foreach ($file in $sizeCheckedFiles) {
-    $ps = [PowerShell]::Create().AddScript($getVideoInfoScript).AddArgument($file.Path).AddArgument($FFPROBE_CMD)
+    $ps = [PowerShell]::Create().AddScript($getVideoInfoScript).AddArgument($file.Path).AddArgument($FFPROBE_CMD).AddArgument($CRF23_BITS_PER_PIXEL)
     $infoJobs += @{ Handle = $ps; AsyncResult = $ps.BeginInvoke(); Path = $file.Path; SizeMB = $file.SizeMB }
 }
 
@@ -310,6 +315,7 @@ while ($infoJobs.Count -gt 0 -or $jobQueue.Count -gt 0 -or $runningJobs.Count -g
                 OutputFile = $tempFile
                 BackupFile = $backupFile
                 VideoInfo = $videoInfo
+                DownscaleThresholdGB = $DOWNSCALE_THRESHOLD_GB
             }
             $completedInfoJobs += $infoJob
         }
