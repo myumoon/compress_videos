@@ -131,13 +131,10 @@ $getVideoInfoScript = {
     return $info
 }
 
-# 出力解像度を決定
+# 出力解像度を決定（推定圧縮後サイズがしきい値以上なら1920:1080にダウンスケール）
 function Get-OutputResolution {
-    param([object]$VideoInfo)
-    $duration = $VideoInfo.Duration / 60
-    $is4k = ($VideoInfo.Width -ge 3840 -or $VideoInfo.Height -ge 2160)
-
-    if ($duration -ge 10 -and $is4k) {
+    param([object]$VideoInfo, [double]$ThresholdGB)
+    if ($VideoInfo.EstimatedSizeGB -ge $ThresholdGB) {
         return "1920:1080"
     }
     return "$($VideoInfo.Width):$($VideoInfo.Height)"
