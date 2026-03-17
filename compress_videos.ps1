@@ -106,6 +106,40 @@ function Get-FileSizeInMB {
     return 0
 }
 
+# 推定圧縮後サイズをGBで算出
+function Get-EstimatedSizeGB {
+    param([int]$Width, [int]$Height, [double]$DurationSec, [double]$BitsPerPixel)
+    return $DurationSec * $Width * $Height * $BitsPerPixel / 8 / 1GB
+}
+
+# バックアップを作成（ハードリンク優先、失敗時はコピー）
+function Invoke-BackupFile {
+    param([string]$SourcePath, [string]$BackupPath)
+    try {
+        New-Item -ItemType HardLink -Path $BackupPath -Target $SourcePath -ErrorAction Stop | Out-Null
+    } catch {
+        Copy-Item -Path $SourcePath -Destination $BackupPath -Force
+    }
+}
+
+# 圧縮成功時：元ファイルを圧縮ファイルで置換
+function Invoke-ReplaceWithCompressed {
+    param([string]$InputFile, [string]$OutputFile, [string]$BackupFile)
+    Remove-Item -Path $InputFile -Force -ErrorAction SilentlyContinue
+    Rename-Item -Path $OutputFile -NewName $InputFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $BackupFile -ErrorAction SilentlyContinue
+}
+
+# 圧縮失敗時：バックアップから元ファイルを復元
+function Invoke-RestoreFromBackup {
+    param([string]$InputFile, [string]$OutputFile, [string]$BackupFile)
+    Remove-Item -Path $OutputFile -Force -ErrorAction SilentlyContinue
+    if (Test-Path $BackupFile) {
+        Remove-Item -Path $InputFile -Force -ErrorAction SilentlyContinue
+        Rename-Item -Path $BackupFile -NewName $InputFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # 動画情報取得スクリプトブロック（並列実行用）
 $getVideoInfoScript = {
     param([string]$FilePath, [string]$FfprobeCmd, [double]$Crf23BitsPerPixel)
@@ -126,8 +160,7 @@ $getVideoInfoScript = {
             $info.Duration = [double]$videoStream.duration
         }
     }
-    # 推定圧縮後サイズ（解像度×bps/ピクセルで算出）
-    $info.EstimatedSizeGB = $info.Duration * $info.Width * $info.Height * $Crf23BitsPerPixel / 8 / 1GB
+    $info.EstimatedSizeGB = Get-EstimatedSizeGB -Width $info.Width -Height $info.Height -DurationSec $info.Duration -BitsPerPixel $Crf23BitsPerPixel
     return $info
 }
 
@@ -140,6 +173,15 @@ function Get-OutputResolution {
     return "$($VideoInfo.Width):$($VideoInfo.Height)"
 }
 
+# ランスペースに注入するヘルパー関数定義（[PowerShell]::Create() は親スコープを継承しないため）
+$runspaceFunctions = [scriptblock]::Create(@"
+function Get-EstimatedSizeGB { $( ${function:Get-EstimatedSizeGB} ) }
+function Invoke-BackupFile { $( ${function:Invoke-BackupFile} ) }
+function Invoke-ReplaceWithCompressed { $( ${function:Invoke-ReplaceWithCompressed} ) }
+function Invoke-RestoreFromBackup { $( ${function:Invoke-RestoreFromBackup} ) }
+function Get-OutputResolution { $( ${function:Get-OutputResolution} ) }
+"@)
+
 # 動画を圧縮（スクリプトブロック）
 $compressionScript = {
     param([object]$Job)
@@ -151,17 +193,9 @@ $compressionScript = {
     $BackupFile = $Job.BackupFile
     $DownscaleThresholdGB = $Job.DownscaleThresholdGB
 
-    # バックアップを作成（ハードリンク優先、失敗時はコピー）
-    try {
-        New-Item -ItemType HardLink -Path $BackupFile -Target $InputFile -ErrorAction Stop | Out-Null
-    } catch {
-        Copy-Item -Path $InputFile -Destination $BackupFile -Force
-    }
+    Invoke-BackupFile -SourcePath $InputFile -BackupPath $BackupFile
 
-    $resolution = "$($VideoInfo.Width):$($VideoInfo.Height)"
-    if ($VideoInfo.EstimatedSizeGB -ge $DownscaleThresholdGB) {
-        $resolution = "1920:1080"
-    }
+    $resolution = Get-OutputResolution -VideoInfo $VideoInfo -ThresholdGB $DownscaleThresholdGB
 
     # CRF値は品質とファイルサイズのバランスを調整するためのもので23は一般的なデフォルト値
     $crf = 23
@@ -181,17 +215,10 @@ $compressionScript = {
     $errorOutput = & $FFMPEG_CMD $command 2>&1
 
     if ($LASTEXITCODE -eq 0) {
-        Remove-Item -Path $InputFile -Force -ErrorAction SilentlyContinue
-        Rename-Item -Path $OutputFile -NewName $InputFile -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path $BackupFile -ErrorAction SilentlyContinue
+        Invoke-ReplaceWithCompressed -InputFile $InputFile -OutputFile $OutputFile -BackupFile $BackupFile
         return @{ Success = $true; File = (Split-Path $InputFile -Leaf); Error = "" }
     } else {
-        # 圧縮失敗時は元ファイルを復元
-        Remove-Item -Path $OutputFile -Force -ErrorAction SilentlyContinue
-        if (Test-Path $BackupFile) {
-            Remove-Item -Path $InputFile -Force -ErrorAction SilentlyContinue
-            Rename-Item -Path $BackupFile -NewName $InputFile -Force -ErrorAction SilentlyContinue
-        }
+        Invoke-RestoreFromBackup -InputFile $InputFile -OutputFile $OutputFile -BackupFile $BackupFile
         $errMsg = ($errorOutput | Out-String).Trim()
         return @{ Success = $false; File = (Split-Path $InputFile -Leaf); Error = $errMsg }
     }
@@ -285,7 +312,8 @@ foreach ($video in $videos) {
 # フェーズ2: 動画情報を並列取得
 $infoJobs = @()
 foreach ($file in $sizeCheckedFiles) {
-    $ps = [PowerShell]::Create().AddScript($getVideoInfoScript).AddArgument($file.Path).AddArgument($FFPROBE_CMD).AddArgument($CRF23_BITS_PER_PIXEL)
+    $ps = [PowerShell]::Create()
+    $null = $ps.AddScript($runspaceFunctions).AddStatement().AddScript($getVideoInfoScript).AddArgument($file.Path).AddArgument($FFPROBE_CMD).AddArgument($CRF23_BITS_PER_PIXEL)
     $infoJobs += @{ Handle = $ps; AsyncResult = $ps.BeginInvoke(); Path = $file.Path; SizeMB = $file.SizeMB }
 }
 
@@ -354,7 +382,8 @@ while ($infoJobs.Count -gt 0 -or $jobQueue.Count -gt 0 -or $runningJobs.Count -g
         Write-Host ""  # スピナーをクリア
         Write-Log "圧縮開始: $(Split-Path $jobItem.InputFile -Leaf)"
 
-        $ps = [PowerShell]::Create().AddScript($compressionScript).AddArgument($jobItem)
+        $ps = [PowerShell]::Create()
+        $null = $ps.AddScript($runspaceFunctions).AddStatement().AddScript($compressionScript).AddArgument($jobItem)
         $asyncResult = $ps.BeginInvoke()
 
         $runningJobs += @{
