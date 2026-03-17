@@ -2,7 +2,8 @@
     [string]$InputPath,
     [double]$DownscaleThresholdGB = 0,  # 0でダウンスケール無効
     [int]$MinSizeMB = 0,                # 0でスキップなし
-    [int]$Crf = 23
+    [int]$Crf = 23,
+    [switch]$GpuEncoding                # GPUエンコーディングを使用する（NVIDIA NVENC）
 )
 
 # 設定値
@@ -34,7 +35,14 @@ function Get-OptimalParallelJobs {
     }
 }
 
+# NVENCエンコーダーが使用可能か確認
+function Test-NvencAvailable {
+    $output = & $FFMPEG_CMD -encoders 2>&1
+    return $null -ne ($output | Select-String "h264_nvenc")
+}
+
 $MAX_PARALLEL_JOBS = 0  # 後で設定される
+$UseGpu = $false        # 後で設定される
 
 # グローバル変数：スピナー状態
 $spinnerIndex = 0
@@ -203,12 +211,17 @@ $compressionScript = {
     $resolution = Get-OutputResolution -VideoInfo $VideoInfo -ThresholdGB $DownscaleThresholdGB
 
     $crf = $Job.Crf
+    $useGpu = $Job.UseGpu
+
+    if ($useGpu) {
+        $videoEncodeArgs = @("-c:v", "h264_nvenc", "-preset", "p4", "-rc:v", "vbr", "-cq", $crf, "-b:v", "0")
+    } else {
+        $videoEncodeArgs = @("-c:v", "libx264", "-preset", "medium", "-crf", $crf)
+    }
 
     $command = @(
-        "-i", $InputFile,
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", $crf,
+        "-i", $InputFile
+    ) + $videoEncodeArgs + @(
         "-vf", "scale=$resolution",
         "-c:a", "aac",
         "-b:a", "128k",
@@ -246,6 +259,16 @@ function Get-VideoFiles {
 
 # メイン処理
 Write-Log "処理開始"
+
+# GPUエンコーディングの可否を確認
+if ($GpuEncoding) {
+    if (Test-NvencAvailable) {
+        $UseGpu = $true
+        Write-Log "GPUエンコーディングを使用します (h264_nvenc)"
+    } else {
+        Write-Log "h264_nvencが使用できません。CPUエンコーディングにフォールバックします" "WARN"
+    }
+}
 
 # 入力パスを複数対応に解析
 if ([string]::IsNullOrWhiteSpace($InputPath)) {
@@ -346,6 +369,7 @@ while ($infoJobs.Count -gt 0 -or $jobQueue.Count -gt 0 -or $runningJobs.Count -g
                 VideoInfo = $videoInfo
                 DownscaleThresholdGB = $DownscaleThresholdGB
                 Crf = $Crf
+                UseGpu = $UseGpu
             }
             $completedInfoJobs += $infoJob
         }
