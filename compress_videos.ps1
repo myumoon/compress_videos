@@ -1,12 +1,12 @@
 ﻿param([string]$InputPath)
 
 # 設定値
-$MIN_SIZE_FOR_COMPRESS = 500MB
+$MIN_SIZE_FOR_COMPRESS = 100MB
 $OUTPUT_FORMAT = "mp4"
 $FFMPEG_CMD = "ffmpeg"
 $FFPROBE_CMD = "ffprobe"
 $CRF23_BITS_PER_PIXEL = 2.5      # CRF 23/medium preset時の推定bps/ピクセル（4K@30fps≒20Mbps、1080p@30fps≒5Mbps）
-$DOWNSCALE_THRESHOLD_GB = 10     # 推定圧縮後サイズがこの値(GB)以上なら1920:1080にダウンスケール
+$DOWNSCALE_THRESHOLD_GB = 100    # 推定圧縮後サイズがこの値(GB)以上なら1920:1080にダウンスケール
 
 # ドライブタイプを判定して並列度を決定
 function Get-OptimalParallelJobs {
