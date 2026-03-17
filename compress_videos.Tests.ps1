@@ -108,6 +108,10 @@ Describe "Get-OutputResolution（ダウンスケール判定）" {
         $info = @{ Width = 2560; Height = 1440; EstimatedSizeGB = 11.0 }
         Get-OutputResolution $info $DOWNSCALE_THRESHOLD_GB | Should -Be "1920:1080"
     }
+    It "ThresholdGB が 0 のときはサイズに関係なくダウンスケールしない" {
+        $info = @{ Width = 3840; Height = 2160; EstimatedSizeGB = 100.0 }
+        Get-OutputResolution $info 0 | Should -Be "3840:2160"
+    }
 }
 
 # -------------------------------------------------------------------------

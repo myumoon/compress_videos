@@ -1,4 +1,9 @@
-﻿param([string]$InputPath)
+﻿param(
+    [string]$InputPath,
+    [double]$DownscaleThresholdGB = 0,  # 0でダウンスケール無効
+    [int]$MinSizeMB = 0,                # 0でスキップなし
+    [int]$Crf = 23
+)
 
 # 設定値
 $MIN_SIZE_FOR_COMPRESS = 500MB
@@ -167,7 +172,7 @@ $getVideoInfoScript = {
 # 出力解像度を決定（推定圧縮後サイズがしきい値以上なら1920:1080にダウンスケール）
 function Get-OutputResolution {
     param([object]$VideoInfo, [double]$ThresholdGB)
-    if ($VideoInfo.EstimatedSizeGB -ge $ThresholdGB) {
+    if ($ThresholdGB -gt 0 -and $VideoInfo.EstimatedSizeGB -ge $ThresholdGB) {
         return "1920:1080"
     }
     return "$($VideoInfo.Width):$($VideoInfo.Height)"
@@ -197,8 +202,7 @@ $compressionScript = {
 
     $resolution = Get-OutputResolution -VideoInfo $VideoInfo -ThresholdGB $DownscaleThresholdGB
 
-    # CRF値は品質とファイルサイズのバランスを調整するためのもので23は一般的なデフォルト値
-    $crf = 23
+    $crf = $Job.Crf
 
     $command = @(
         "-i", $InputFile,
@@ -301,7 +305,7 @@ foreach ($video in $videos) {
     $filePath = $video.FullName
     $fileSizeMB = Get-FileSizeInMB $filePath
 
-    if ($fileSizeMB -le ($MIN_SIZE_FOR_COMPRESS / 1MB)) {
+    if ($MinSizeMB -gt 0 -and $fileSizeMB -le $MinSizeMB) {
         Write-Log "スキップ: $(Split-Path $filePath -Leaf) ($('{0:F1}' -f $fileSizeMB) MB)" "WARN"
         $skipped++
         continue
@@ -340,7 +344,8 @@ while ($infoJobs.Count -gt 0 -or $jobQueue.Count -gt 0 -or $runningJobs.Count -g
                 OutputFile = $tempFile
                 BackupFile = $backupFile
                 VideoInfo = $videoInfo
-                DownscaleThresholdGB = $DOWNSCALE_THRESHOLD_GB
+                DownscaleThresholdGB = $DownscaleThresholdGB
+                Crf = $Crf
             }
             $completedInfoJobs += $infoJob
         }
