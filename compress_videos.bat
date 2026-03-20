@@ -37,7 +37,9 @@ if "!input_path!"=="" (
 )
 
 :execute
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0compress_videos.ps1" "!input_path!" -GpuEncoding
+set log_flag=-OutputLog
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0compress_videos.ps1" "!input_path!" -GpuEncoding !log_flag!
 if errorlevel 1 (
     echo エラー: 圧縮処理中に問題が発生しました
     pause

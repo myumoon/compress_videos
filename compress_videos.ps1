@@ -3,7 +3,8 @@
     [double]$DownscaleThresholdGB = 0,  # 0でダウンスケール無効
     [int]$MinSizeMB = 0,                # 0でスキップなし
     [int]$Crf = 23,
-    [switch]$GpuEncoding                # GPUエンコーディングを使用する（NVIDIA NVENC）
+    [switch]$GpuEncoding,               # GPUエンコーディングを使用する（NVIDIA NVENC）
+    [switch]$OutputLog                  # 変換結果をCSVファイルに出力する
 )
 
 # 設定値
@@ -109,6 +110,17 @@ function Show-Progress {
     Write-Host "`r[$bar] $percentage% ($Current/$Total) - $Activity" -NoNewline -ForegroundColor Green
 }
 
+# 変換ログをCSVに追記
+function Write-CsvLog {
+    param([object]$Result)
+    $dir = Split-Path $Result.InputFile -Parent
+    $csvPath = Join-Path $dir ".movie_reduction.csv"
+    $sourceMB = [math]::Round($Result.SourceSizeMB, 1)
+    $outputMB = [math]::Round($Result.OutputSizeMB, 1)
+    $line = "$($Result.File),$($Result.SourceResolution),$($Result.OutputResolution),$sourceMB,$outputMB"
+    Add-Content -Path $csvPath -Value $line -Encoding UTF8
+}
+
 # ファイルサイズを取得
 function Get-FileSizeInMB {
     param([string]$FilePath)
@@ -205,6 +217,7 @@ $compressionScript = {
     $VideoInfo = $Job.VideoInfo
     $BackupFile = $Job.BackupFile
     $DownscaleThresholdGB = $Job.DownscaleThresholdGB
+    $SourceSizeMB = $Job.SourceSizeMB
 
     Invoke-BackupFile -SourcePath $InputFile -BackupPath $BackupFile
 
@@ -233,7 +246,10 @@ $compressionScript = {
 
     if ($LASTEXITCODE -eq 0) {
         Invoke-ReplaceWithCompressed -InputFile $InputFile -OutputFile $OutputFile -BackupFile $BackupFile
-        return @{ Success = $true; File = (Split-Path $InputFile -Leaf); Error = "" }
+        $outputSizeMB = (Get-Item $InputFile -ErrorAction SilentlyContinue).Length / 1MB
+        $sourceRes = "$($VideoInfo.Width)x$($VideoInfo.Height)"
+        $outputRes = $resolution -replace ':', 'x'
+        return @{ Success = $true; File = (Split-Path $InputFile -Leaf); InputFile = $InputFile; SourceResolution = $sourceRes; OutputResolution = $outputRes; SourceSizeMB = $SourceSizeMB; OutputSizeMB = $outputSizeMB; Error = "" }
     } else {
         Invoke-RestoreFromBackup -InputFile $InputFile -OutputFile $OutputFile -BackupFile $BackupFile
         $errMsg = ($errorOutput | Out-String).Trim()
@@ -370,6 +386,7 @@ while ($infoJobs.Count -gt 0 -or $jobQueue.Count -gt 0 -or $runningJobs.Count -g
                 DownscaleThresholdGB = $DownscaleThresholdGB
                 Crf = $Crf
                 UseGpu = $UseGpu
+                SourceSizeMB = $fileSizeMB
             }
             $completedInfoJobs += $infoJob
         }
@@ -387,6 +404,9 @@ while ($infoJobs.Count -gt 0 -or $jobQueue.Count -gt 0 -or $runningJobs.Count -g
                 Write-Host ""  # スピナーをクリア
                 Write-Log "圧縮完了: $($result.File)" "SUCCESS"
                 $processed++
+                if ($OutputLog) {
+                    Write-CsvLog $result
+                }
             } else {
                 Write-Host ""  # スピナーをクリア
                 Write-Log "圧縮失敗: $($result.File)`n$($result.Error)" "ERROR"
