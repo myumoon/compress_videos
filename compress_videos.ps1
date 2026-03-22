@@ -236,8 +236,7 @@ $compressionScript = {
         "-i", $InputFile
     ) + $videoEncodeArgs + @(
         "-vf", "scale=$resolution",
-        "-c:a", "aac",
-        "-b:a", "128k",
+        "-c:a", "copy",
         "-y",
         $OutputFile
     )
